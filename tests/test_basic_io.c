@@ -224,7 +224,9 @@ int main(void)
     CHECK_RET(write(fd, page, 4096), 4096, "write 4096 字节 (一页)");
 
     /* write 8192 字节 (两页) */
-    CHECK_RET(write(fd, page, 8192), 8192, "write 8192 字节 (两页)");
+    char two_pages[8192];
+    memset(two_pages, 'Q', sizeof(two_pages));
+    CHECK_RET(write(fd, two_pages, 8192), 8192, "write 8192 字节 (两页)");
 
     /* 验证文件大小 */
     off_t total_size = lseek(fd, 0, SEEK_END);

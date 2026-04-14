@@ -52,11 +52,34 @@ header()  { echo -e "\n${C_BOLD}${C_BLUE}═════════════
             echo -e "${C_BOLD}${C_BLUE}  $*${C_RESET}"; \
             echo -e "${C_BOLD}${C_BLUE}══════════════════════════════════════════════════${C_RESET}\n"; }
 
-# Test program definitions
-declare -a TEST_NAMES=("test_brk" "test_mmap" "test_stat" "futex_test")
-declare -a TEST_SRCS=("test_brk.c" "test_mmap.c" "test_stat.c" "futex_test.c")
-declare -a TEST_LDFLAGS=("" "" "" "-lpthread")
-declare -a TEST_TIMEOUTS=(30 30 30 120)  # Per-test timeout in seconds
+# Test program definitions.
+# Keep this list aligned with docs/syscall_priority.md and tests/.
+declare -a TEST_NAMES=(
+    "test_basic_io"
+    "test_openat"
+    "test_stat"
+    "test_pipe2"
+    "test_fork_v2"
+    "test_dup_v2"
+    "test_mmap"
+    "test_signal"
+    "test_brk"
+    "test_accept4"
+)
+declare -a TEST_SRCS=(
+    "tests/test_basic_io.c"
+    "tests/test_openat.c"
+    "tests/test_stat.c"
+    "tests/test_pipe2.c"
+    "tests/test_fork_v2.c"
+    "tests/test_dup_v2.c"
+    "tests/test_mmap.c"
+    "tests/test_signal.c"
+    "tests/test_brk.c"
+    "tests/test_accept4.c"
+)
+declare -a TEST_LDFLAGS=("" "" "" "" "" "" "" "" "" "")
+declare -a TEST_TIMEOUTS=(30 30 30 30 60 30 30 30 30 30)  # Per-test timeout in seconds
 
 # Cross-compiler command per architecture
 declare -A CROSS_CC=(
@@ -414,7 +437,10 @@ phase2_starryos_tests() {
     ok "Test binaries copied to /bin/"
 
     # Create the test runner script on rootfs
-    sudo tee "${mountpoint}/bin/run_syscall_tests.sh" >/dev/null << 'RUNNER'
+    local runner_tests
+    runner_tests=$(printf '/bin/%s ' "${TEST_NAMES[@]}")
+
+    sudo tee "${mountpoint}/bin/run_syscall_tests.sh" >/dev/null <<RUNNER
 #!/bin/sh
 # ──────────────────────────────────────────────
 #  Automated Syscall Test Runner for StarryOS
@@ -429,7 +455,7 @@ TOTAL=0
 PASSED=0
 FAILED=0
 
-for test_bin in /bin/test_brk /bin/test_mmap /bin/test_stat /bin/test_futex; do
+for test_bin in ${runner_tests}; do
     if [ -x "$test_bin" ]; then
         echo "--- Running $(basename $test_bin) ---"
         TOTAL=$((TOTAL + 1))

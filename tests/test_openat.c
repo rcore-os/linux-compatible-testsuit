@@ -1,13 +1,14 @@
 /*
- * test_openat.c — openat 系统调用完整测试 v2
+ * test_openat.c — open/openat 系统调用完整测试 v3
  *
  * 测试策略：不仅验证返回值，还通过独立观测手段验证功能语义真正生效。
  * 遵循 sys_design.md "操作→观测→验证" 三步法。
  *
- * 覆盖范围（v2 新增）：
- *   正向：O_TRUNC、O_APPEND、dirfd+相对路径、umask、O_CLOEXEC、O_NOFOLLOW、
- *         O_DIRECTORY、O_SYNC、creat等价、O_PATH、mode参数、O_TMPFILE
- *   负向：EBADF/ENOENT/EEXIST/ENOTDIR/EFAULT/EACCES/ELOOP/EINVAL
+ * 覆盖范围（v3 新增）：
+ *   正向：open 初始 offset、最低可用 fd、默认非 FD_CLOEXEC、O_TRUNC、
+ *         O_APPEND、dirfd+相对路径、umask、O_CLOEXEC、O_NOFOLLOW、
+ *         O_DIRECTORY、O_SYNC、creat 等价、mode 参数
+ *   负向：open/openat 的 EBADF/ENOENT/EEXIST/ENOTDIR/EFAULT/EACCES/ELOOP/EINVAL
  */
 
 #include "test_framework.h"
@@ -28,7 +29,7 @@
 
 int main(void)
 {
-    TEST_START("openat: 完整功能语义验证 v2（含新增用例）");
+    TEST_START("open/openat: 完整功能语义验证 v3");
 
     /* 清理可能残留的旧文件 */
     unlink(TMPFILE);
@@ -68,7 +69,41 @@ int main(void)
     CHECK(st.st_size == msg_len, "stat 验证文件大小正确");
 
     /* ================================================================
-     * PART 2: O_TRUNC — 截断语义验证
+     * PART 2: open(2) 直接语义验证
+     *
+     * man 2 open:
+     *   - 返回当前最低可用 fd
+     *   - 默认不设置 FD_CLOEXEC
+     *   - 初始 file offset 位于文件起始
+     * ================================================================ */
+
+    unlink(TMPFILE2);
+
+    int open_fd1 = open(TMPFILE2, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    CHECK(open_fd1 >= 0, "open O_CREAT|O_RDWR|O_TRUNC 创建文件成功");
+
+    if (open_fd1 >= 0) {
+        off_t open_off = lseek(open_fd1, 0, SEEK_CUR);
+        CHECK_RET(open_off, 0, "open: 初始 file offset 位于文件起始");
+
+        int open_flags = fcntl(open_fd1, F_GETFD);
+        CHECK(open_flags >= 0, "open: F_GETFD 成功");
+        CHECK((open_flags & FD_CLOEXEC) == 0, "open: 默认未设置 FD_CLOEXEC");
+
+        int open_fd2 = open(TMPFILE, O_RDONLY);
+        CHECK(open_fd2 >= 0, "open: 第二次打开已有文件成功");
+        if (open_fd2 >= 0) {
+            CHECK(open_fd2 == open_fd1 + 1,
+                  "open: 成功返回当前最低可用 fd（顺序递增）");
+            close(open_fd2);
+        }
+
+        CHECK_RET(write(open_fd1, "open", 4), 4, "open: 返回的 fd 可直接写入");
+        close(open_fd1);
+    }
+
+    /* ================================================================
+     * PART 3: O_TRUNC — 截断语义验证
      * ================================================================ */
 
     CHECK_RET(stat(TMPFILE, &st), 0, "O_TRUNC 前: stat 成功");
@@ -88,7 +123,7 @@ int main(void)
     CHECK(st.st_size == 0, "O_TRUNC 后: st_size==0（截断真正生效）");
 
     /* ================================================================
-     * PART 3: O_APPEND — 追加模式验证
+     * PART 4: O_APPEND — 追加模式验证
      * ================================================================ */
 
     fd = openat(AT_FDCWD, TMPFILE, O_CREAT | O_RDWR | O_TRUNC | O_APPEND, 0644);
@@ -111,7 +146,7 @@ int main(void)
     close(fd);
 
     /* ================================================================
-     * PART 4: dirfd + 相对路径
+     * PART 5: dirfd + 相对路径
      * ================================================================ */
 
     CHECK_RET(mkdir(TMPDIR, 0755), 0, "mkdir 创建测试目录");
@@ -135,9 +170,10 @@ int main(void)
     CHECK(st.st_size == 9, "dirfd: 子文件大小正确");
 
     /* ================================================================
-     * PART 5: umask 影响
+     * PART 6: umask 影响
      * ================================================================ */
 
+    unlink(TMPFILE2);
     mode_t old_umask = umask(077);
     fd = openat(AT_FDCWD, TMPFILE2, O_CREAT | O_RDWR | O_TRUNC, 0666);
     CHECK(fd >= 0, "umask(077) 后 openat 创建文件 (mode=0666)");
@@ -146,10 +182,10 @@ int main(void)
 
     /* 观测：stat 验证权限被 umask 屏蔽 */
     CHECK_RET(stat(TMPFILE2, &st), 0, "umask: stat 获取文件信息");
-    CHECK((st.st_mode & 0777) == 0600, "umask: (st_mode & 0777) == 0600");
+    CHECK_RET((st.st_mode & 0777), 0600, "umask: (st_mode & 0777) == 0600");
 
     /* ================================================================
-     * PART 6: O_CLOEXEC — fork 后 exec 自动关闭
+     * PART 7: O_CLOEXEC — fork 后 exec 自动关闭
      * ================================================================ */
 
     fd = openat(AT_FDCWD, TMPFILE, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
@@ -182,7 +218,7 @@ int main(void)
     }
 
     /* ================================================================
-     * PART 7: O_NOFOLLOW — 符号链接安全
+     * PART 8: O_NOFOLLOW — 符号链接安全
      * ================================================================ */
 
     /* 创建符号链接 */
@@ -207,7 +243,7 @@ int main(void)
     /* Linux: 对符号链接使用 O_NOFOLLOW 会返回 ELOOP */
 
     /* ================================================================
-     * PART 8: O_DIRECTORY — 目录验证
+     * PART 9: O_DIRECTORY — 目录验证
      * ================================================================ */
 
     fd = openat(AT_FDCWD, TMPFILE, O_RDONLY | O_DIRECTORY);
@@ -223,7 +259,7 @@ int main(void)
     if (fd >= 0) close(fd);
 
     /* ================================================================
-     * PART 9: O_SYNC — 同步写入（⚠️ 环境限制，简化验证）
+     * PART 10: O_SYNC — 同步写入（⚠️ 环境限制，简化验证）
      * ================================================================ */
 
     fd = openat(AT_FDCWD, TMPFILE, O_CREAT | O_RDWR | O_SYNC, 0644);
@@ -236,7 +272,7 @@ int main(void)
     }
 
     /* ================================================================
-     * PART 10: creat() 等价测试
+     * PART 11: creat() 等价测试
      * ================================================================ */
 
     fd = openat(AT_FDCWD, TMPFILE2, O_CREAT | O_WRONLY | O_TRUNC, 0644);
@@ -250,7 +286,7 @@ int main(void)
     }
 
     /* ================================================================
-     * PART 11: mode 参数影响
+     * PART 12: mode 参数影响
      * ================================================================ */
 
     /* 先删除可能存在的旧文件，避免权限残留 */
@@ -270,7 +306,7 @@ int main(void)
     umask(022);
 
     /* ================================================================
-     * PART 12: 负向测试 — 错误路径
+     * PART 13: 负向测试 — 错误路径
      * ================================================================ */
 
     /* 12.1 close 无效 fd */
@@ -334,9 +370,12 @@ int main(void)
     }
 
     /* 12.9 openat NULL 路径 */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull"
     errno = 0;
     CHECK_ERR(openat(AT_FDCWD, (const char *)NULL, O_RDONLY),
               EFAULT, "openat NULL 路径 → EFAULT");
+#pragma GCC diagnostic pop
 
     /* 12.10 openat 超长路径 */
     char longpath[4100];
@@ -351,6 +390,29 @@ int main(void)
     errno = 0;
     CHECK_ERR(openat(AT_FDCWD, "", O_RDONLY),
               ENOENT, "openat 空路径 → ENOENT");
+
+    /* 12.12 open 不存在文件 */
+    errno = 0;
+    CHECK_ERR(open("/tmp/starry_open_not_exist_12345", O_RDONLY),
+              ENOENT, "open 无 O_CREAT 打开不存在文件 → ENOENT");
+
+    /* 12.13 open O_CREAT|O_EXCL 已存在文件 */
+    errno = 0;
+    CHECK_ERR(open(TMPFILE, O_CREAT | O_EXCL | O_RDWR, 0644),
+              EEXIST, "open O_CREAT|O_EXCL 已存在文件 → EEXIST");
+
+    /* 12.14 open 目录做写打开 */
+    errno = 0;
+    CHECK_ERR(open(TMPDIR, O_WRONLY),
+              EISDIR, "open 目录做 O_WRONLY 打开 → EISDIR");
+
+    /* 12.15 open NULL 路径 */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull"
+    errno = 0;
+    CHECK_ERR(open((const char *)NULL, O_RDONLY),
+              EFAULT, "open NULL 路径 → EFAULT");
+#pragma GCC diagnostic pop
 
     /* ================================================================
      * 清理

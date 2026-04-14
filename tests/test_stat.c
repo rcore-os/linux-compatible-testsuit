@@ -412,6 +412,77 @@ static void test_fstatat_einval(void)
     ASSERT_ERR(fstatat(AT_FDCWD, path, &sb, 0xFFFF), EINVAL);
 }
 
+/* Test 22: statx() on a regular file */
+static void test_statx_regular_file(void)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/regfile.txt", basedir);
+
+    struct statx stx;
+    memset(&stx, 0, sizeof(stx));
+
+    ASSERT_OK(statx(AT_FDCWD, path, AT_STATX_SYNC_AS_STAT,
+                    STATX_BASIC_STATS, &stx));
+    TEST_ASSERT((stx.stx_mask & STATX_TYPE) != 0, 1, (stx.stx_mask & STATX_TYPE) != 0);
+    TEST_ASSERT((stx.stx_mask & STATX_SIZE) != 0, 1, (stx.stx_mask & STATX_SIZE) != 0);
+    TEST_ASSERT(S_ISREG(stx.stx_mode), 1, S_ISREG(stx.stx_mode));
+    TEST_ASSERT(stx.stx_size == 12, 12, (intmax_t)stx.stx_size);
+    TEST_ASSERT(stx.stx_uid == getuid(), getuid(), (intmax_t)stx.stx_uid);
+    TEST_ASSERT(stx.stx_gid == getgid(), getgid(), (intmax_t)stx.stx_gid);
+}
+
+/* Test 23: statx() with AT_SYMLINK_NOFOLLOW */
+static void test_statx_symlink_nofollow(void)
+{
+    char linkpath[512];
+    snprintf(linkpath, sizeof(linkpath), "%s/link_to_regfile", basedir);
+
+    struct statx stx;
+    memset(&stx, 0, sizeof(stx));
+
+    ASSERT_OK(statx(AT_FDCWD, linkpath, AT_SYMLINK_NOFOLLOW,
+                    STATX_BASIC_STATS, &stx));
+    TEST_ASSERT(S_ISLNK(stx.stx_mode), 1, S_ISLNK(stx.stx_mode));
+}
+
+/* Test 24: statx() with AT_EMPTY_PATH on an existing fd */
+static void test_statx_empty_path(void)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/regfile.txt", basedir);
+
+    int fd = open(path, O_RDONLY);
+    assert(fd >= 0);
+
+    struct statx stx;
+    memset(&stx, 0, sizeof(stx));
+
+    ASSERT_OK(statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &stx));
+    TEST_ASSERT(S_ISREG(stx.stx_mode), 1, S_ISREG(stx.stx_mode));
+    TEST_ASSERT(stx.stx_size == 12, 12, (intmax_t)stx.stx_size);
+
+    close(fd);
+}
+
+/* Test 25: statx() empty path without AT_EMPTY_PATH => ENOENT */
+static void test_statx_empty_path_enoent(void)
+{
+    struct statx stx;
+    memset(&stx, 0, sizeof(stx));
+    ASSERT_ERR(statx(AT_FDCWD, "", 0, STATX_BASIC_STATS, &stx), ENOENT);
+}
+
+/* Test 26: statx() reserved mask bit => EINVAL */
+static void test_statx_reserved_mask_einval(void)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/regfile.txt", basedir);
+
+    struct statx stx;
+    memset(&stx, 0, sizeof(stx));
+    ASSERT_ERR(statx(AT_FDCWD, path, 0, 0x80000000U, &stx), EINVAL);
+}
+
 /* ===========================================================================
  * Main
  * =========================================================================== */
@@ -447,6 +518,13 @@ int main(void)
     printf("\nfstatat() tests:\n");
     RUN_TEST(test_fstatat_symlink_nofollow);
     RUN_TEST(test_fstatat_einval);
+
+    printf("\nstatx() tests:\n");
+    RUN_TEST(test_statx_regular_file);
+    RUN_TEST(test_statx_symlink_nofollow);
+    RUN_TEST(test_statx_empty_path);
+    RUN_TEST(test_statx_empty_path_enoent);
+    RUN_TEST(test_statx_reserved_mask_einval);
 
     teardown();
 

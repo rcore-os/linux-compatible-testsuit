@@ -24,6 +24,8 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -45,6 +47,22 @@ static int create_tmpfile_rw(const char *name, const void *data, size_t len)
     if (fd < 0) return -1;
     if (write(fd, data, len) != (ssize_t)len) { close(fd); return -1; }
     return fd;
+}
+
+static void expect_child_sigsegv_on_write(char *addr)
+{
+    pid_t pid = fork();
+    assert(pid >= 0);
+
+    if (pid == 0) {
+        addr[0] = 'X';
+        _exit(0);
+    }
+
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFSIGNALED(status));
+    assert(WTERMSIG(status) == SIGSEGV);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -211,6 +229,28 @@ static void test_prot_none(void)
     void *addr = mmap(NULL, page_size, PROT_NONE,
                       MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     assert(addr != MAP_FAILED);
+    assert(munmap(addr, page_size) == 0);
+}
+
+/*
+ * mprotect(PROT_READ) should forbid writes; restoring PROT_READ|PROT_WRITE
+ * should allow writes again.
+ */
+static void test_mprotect_readonly_then_restore(void)
+{
+    char *addr = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+                      MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    assert(addr != MAP_FAILED);
+
+    addr[0] = 'A';
+    assert(mprotect(addr, page_size, PROT_READ) == 0);
+    assert(addr[0] == 'A');
+    expect_child_sigsegv_on_write(addr);
+
+    assert(mprotect(addr, page_size, PROT_READ | PROT_WRITE) == 0);
+    addr[0] = 'B';
+    assert(addr[0] == 'B');
+
     assert(munmap(addr, page_size) == 0);
 }
 
@@ -458,6 +498,63 @@ static void test_munmap_einval_unaligned(void)
     assert(munmap(addr, page_size * 2) == 0);
 }
 
+/*
+ * EACCES: a read-only shared file mapping cannot be upgraded to PROT_WRITE.
+ */
+static void test_mprotect_eacces_readonly_file(void)
+{
+    const char *path = TMP_BASE "mprot_ro";
+    int fd = create_tmpfile_rw(path, "abcd", 4);
+    assert(fd >= 0);
+    close(fd);
+    assert(chmod(path, 0444) == 0);
+
+    fd = open(path, O_RDONLY);
+    assert(fd >= 0);
+
+    void *addr = mmap(NULL, page_size, PROT_READ, MAP_SHARED, fd, 0);
+    assert(addr != MAP_FAILED);
+
+    errno = 0;
+    assert(mprotect(addr, page_size, PROT_READ | PROT_WRITE) == -1);
+    assert(errno == EACCES);
+
+    assert(munmap(addr, page_size) == 0);
+    close(fd);
+    unlink(path);
+}
+
+/*
+ * EINVAL: addr must be page aligned.
+ */
+static void test_mprotect_einval_unaligned_addr(void)
+{
+    char *addr = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+                      MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    assert(addr != MAP_FAILED);
+
+    errno = 0;
+    assert(mprotect(addr + 1, page_size, PROT_READ) == -1);
+    assert(errno == EINVAL);
+
+    assert(munmap(addr, page_size) == 0);
+}
+
+/*
+ * ENOMEM: the target range is no longer mapped.
+ */
+static void test_mprotect_enomem_unmapped(void)
+{
+    void *addr = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+                      MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    assert(addr != MAP_FAILED);
+    assert(munmap(addr, page_size) == 0);
+
+    errno = 0;
+    assert(mprotect(addr, page_size, PROT_READ) == -1);
+    assert(errno == ENOMEM);
+}
+
 /* ══════════════════════════════════════════════════════════════════
  * Main
  * ══════════════════════════════════════════════════════════════════ */
@@ -477,6 +574,7 @@ int main(void)
     RUN_TEST(multi_page_mapping);
     RUN_TEST(map_fixed);
     RUN_TEST(prot_none);
+    RUN_TEST(mprotect_readonly_then_restore);
     RUN_TEST(munmap_double);
     RUN_TEST(partial_munmap);
     RUN_TEST(fd_close_no_invalidate);
@@ -492,6 +590,9 @@ int main(void)
     RUN_TEST(eexist_fixed_noreplace);
     RUN_TEST(enomem_exceeds_vaddr);
     RUN_TEST(munmap_einval_unaligned);
+    RUN_TEST(mprotect_eacces_readonly_file);
+    RUN_TEST(mprotect_einval_unaligned_addr);
+    RUN_TEST(mprotect_enomem_unmapped);
 
     printf("\nAll tests passed!\n");
     return 0;
