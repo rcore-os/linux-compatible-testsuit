@@ -5,6 +5,7 @@
 当前仓库支持两种运行方式：
 
 - **Linux 多架构模式**：在宿主 Linux 上直接运行，或通过 QEMU user-mode 运行交叉架构静态二进制
+- **Linux QEMU-system 参考模式**：在 QEMU-system 启动的 Linux guest 中运行同一批静态二进制，作为 StarryOS 对比基线
 - **StarryOS 模式**：将测试程序注入 StarryOS 当前使用的 rootfs ext4 镜像，并通过专用 QEMU 配置自动执行
 
 ## 当前已包含的测试
@@ -32,6 +33,34 @@
 ./run_all_tests.sh --linux-only
 ```
 
+### 运行 Linux QEMU-system 参考基线
+
+第一版当前支持 `x86_64`。需要：
+
+- 安装 `busybox-static`
+- 提供一个可由 `qemu-system-x86_64` 启动的 Linux kernel image
+- 该 kernel 在启动时可用 `ext4`、`virtio-blk` 和 `ttyS0` console 支持
+
+可以把 kernel 放在仓库的 `linux-guest-assets/x86_64/` 下，文件名为 `bzImage`、`vmlinuz` 或 `Image`；也可以显式传参：
+
+```bash
+./run_all_tests.sh --linux-system --linux-system-kernel /path/to/bzImage
+```
+
+脚本会自动：
+
+- 构建同一批静态测试二进制
+- 生成一个最小 ext4 rootfs
+- 注入 `busybox`、runner 和测试程序
+- 通过 `qemu-system-x86_64` 启动 Linux guest
+- 解析与 StarryOS 相同的 `@@@ STARRY_TEST_*` 标记输出
+
+如果要只跑这层参考基线：
+
+```bash
+./run_all_tests.sh --linux-system-only --linux-system-kernel /path/to/bzImage
+```
+
 ### 只跑 StarryOS
 
 ```bash
@@ -53,6 +82,11 @@
 ## 主要参数
 
 - `--linux-only`: 只运行 Linux 阶段
+- `--linux-system`: 额外运行 Linux QEMU-system guest 参考阶段
+- `--linux-system-only`: 只运行 Linux QEMU-system guest 参考阶段
+- `--linux-system-arch ARCH`: 指定 Linux guest 架构，当前仅支持 `x86_64`
+- `--linux-system-kernel PATH`: 指定 Linux guest kernel image
+- `--linux-system-timeout SEC`: Linux guest 超时时间
 - `--starry-only`: 只运行 StarryOS 阶段
 - `--starry-arch ARCH`: 指定 StarryOS 目标架构，默认 `x86_64`
 - `--tgoskits DIR`: 指定 `tgoskits` 仓库路径
@@ -63,6 +97,11 @@
 - `TGOSKITS_DIR`
 - `STARRY_ARCH`
 - `STARRY_TIMEOUT`
+- `LINUX_SYSTEM_ARCH`
+- `LINUX_SYSTEM_KERNEL`
+- `LINUX_SYSTEM_TIMEOUT`
+- `LINUX_SYSTEM_MEMORY`
+- `LINUX_SYSTEM_ROOTFS_MB`
 - `MUSL_CC`: 指定 x86_64 musl 编译器，例如 `x86_64-linux-musl-gcc`
 
 ## 依赖
@@ -71,7 +110,7 @@ Ubuntu/Debian 下可参考：
 
 ```bash
 sudo apt install musl-tools gcc-riscv64-linux-gnu gcc-aarch64-linux-gnu \
-    qemu-user-static qemu-system-misc qemu-system-arm \
+    qemu-user-static qemu-system-misc qemu-system-arm busybox-static \
     rustc cargo e2fsprogs
 ```
 
@@ -85,6 +124,9 @@ sudo apt install musl-tools gcc-riscv64-linux-gnu gcc-aarch64-linux-gnu \
 
 - 构建产物默认位于 `build/`
 - 日志默认位于 `logs/`
+- Linux QEMU-system 参考阶段会额外产出：
+  - 自动生成的 ext4 rootfs 镜像
+  - QEMU 串口日志
 - StarryOS 阶段会额外产出：
   - 注入测例后的隔离 rootfs 镜像
   - 专用 QEMU 配置文件
