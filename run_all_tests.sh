@@ -52,18 +52,24 @@ header()  { echo -e "\n${C_BOLD}${C_BLUE}═════════════
             echo -e "${C_BOLD}${C_BLUE}  $*${C_RESET}"; \
             echo -e "${C_BOLD}${C_BLUE}══════════════════════════════════════════════════${C_RESET}\n"; }
 
-# Test program definitions
-declare -a TEST_NAMES=("test_brk" "test_mmap" "test_stat" "futex_test")
-declare -a TEST_SRCS=("test_brk.c" "test_mmap.c" "test_stat.c" "futex_test.c")
-declare -a TEST_LDFLAGS=("" "" "" "-lpthread")
-declare -a TEST_TIMEOUTS=(30 30 30 120)  # Per-test timeout in seconds
+# Test program source directory
+TEST_PROGRAMS_DIR="${SCRIPT_DIR}/test_program"
 
-# Cross-compiler command per architecture
+# Per-test default timeout (seconds)
+DEFAULT_TEST_TIMEOUT=30
+
+# These arrays are populated by discover_tests()
+declare -a TEST_NAMES=()      # binary name  (e.g. "test_brk")
+declare -a TEST_SRCS=()       # source path  (e.g. "test_program/test_brk.c")
+declare -a TEST_LDFLAGS=()    # extra link flags (e.g. "-lpthread")
+declare -a TEST_TIMEOUTS=()   # per-test timeout
+
+# Musl-based cross-compiler per architecture
+# Toolchain layout: <MUSL_CROSS_ROOT>/<arch>-linux-musl-cross/bin/<arch>-linux-musl-gcc
+MUSL_CROSS_ROOT="${MUSL_CROSS_ROOT:-/home/wyatt/package}"
 declare -A CROSS_CC=(
-    [x86_64]="gcc"
-    [riscv64]="riscv64-linux-gnu-gcc"
-    [aarch64]="aarch64-linux-gnu-gcc"
-    [loongarch64]="loongarch64-linux-gnu-gcc"
+    [x86_64]="${MUSL_CROSS_ROOT}/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc"
+    [riscv64]="${MUSL_CROSS_ROOT}/riscv64-linux-musl-cross/bin/riscv64-linux-musl-gcc"
 )
 
 # QEMU user-mode emulator per architecture (for Linux cross-arch testing)
@@ -123,6 +129,50 @@ if [[ -z "$TGOSKITS_DIR" ]]; then
 fi
 
 # ============================================================
+#  Test Discovery
+# ============================================================
+
+discover_tests() {
+    if [[ ! -d "$TEST_PROGRAMS_DIR" ]]; then
+        err "Test program directory not found: $TEST_PROGRAMS_DIR"
+        err "Expected: <repo>/test_program/*.c"
+        exit 1
+    fi
+
+    local -a c_files=()
+    while IFS= read -r -d '' f; do
+        c_files+=("$f")
+    done < <(find "$TEST_PROGRAMS_DIR" -maxdepth 1 -name '*.c' -type f -print0 | sort -z)
+
+    if [[ ${#c_files[@]} -eq 0 ]]; then
+        err "No .c files found in $TEST_PROGRAMS_DIR"
+        exit 1
+    fi
+
+    info "Discovered ${#c_files[@]} test program(s) in test_program/"
+
+    for src_path in "${c_files[@]}"; do
+        local src_file
+        src_file="$(basename "$src_path")"
+        local name="${src_file%.c}"
+
+        TEST_NAMES+=("$name")
+        TEST_SRCS+=("$src_path")          # full path now, not relative
+        TEST_TIMEOUTS+=("$DEFAULT_TEST_TIMEOUT")
+
+        # Auto-detect -lpthread: scan source for pthread usage
+        if grep -qE '(pthread_create|pthread_join|pthread_mutex|pthread_cond|#include\s*<pthread)' "$src_path" 2>/dev/null; then
+            TEST_LDFLAGS+=("-lpthread")
+            TEST_TIMEOUTS[-1]=120  # pthread tests tend to run longer
+            info "  $src_file  (needs -lpthread)"
+        else
+            TEST_LDFLAGS+=("")
+            info "  $src_file"
+        fi
+    done
+}
+
+# ============================================================
 #  Cleanup
 # ============================================================
 
@@ -159,12 +209,26 @@ check_prerequisites() {
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
 
+    # Check musl cross-compilers for available architectures
+    for arch in "${!CROSS_CC[@]}"; do
+        local cc="${CROSS_CC[$arch]}"
+        if [[ -x "$cc" ]]; then
+            ok "musl CC for $arch: $cc"
+        else
+            warn "musl CC for $arch not found: $cc"
+            unset CROSS_CC[$arch]
+        fi
+    done
+
+    if [[ ${#CROSS_CC[@]} -eq 0 ]]; then
+        missing+=("musl cross-compiler (expected in $MUSL_CROSS_ROOT)")
+    fi
+
     # QEMU user-mode for cross-arch Linux testing
-    for arch in riscv64 aarch64; do
+    for arch in "${!QEMU_USER[@]}"; do
         if command -v "${QEMU_USER[$arch]}" &>/dev/null; then
             : # available
         elif command -v "${QEMU_USER[$arch]/-static/}" &>/dev/null; then
-            # Some distros install without -static suffix
             QEMU_USER[$arch]="${QEMU_USER[$arch]/-static/}"
         else
             warn "QEMU user-mode for $arch not found — that arch will be skipped"
@@ -191,11 +255,6 @@ check_prerequisites() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         err "Missing prerequisites:"
         printf '    - %s\n' "${missing[@]}"
-        echo ""
-        info "Install on Ubuntu/Debian:"
-        echo "  sudo apt install gcc-riscv64-linux-gnu gcc-aarch64-linux-gnu \\"
-        echo "       qemu-user-static qemu-system-misc qemu-system-arm \\"
-        echo "       rustc cargo sudo e2fsprogs"
         exit 1
     fi
 
@@ -216,20 +275,22 @@ phase1_linux_tests() {
 
     # Determine which architectures we can test
     local -a test_arches=()
-    for arch in x86_64 riscv64 aarch64; do
+    for arch in "${!CROSS_CC[@]}"; do
         local cc="${CROSS_CC[$arch]}"
+        if [[ ! -x "$cc" ]]; then
+            warn "Skipping $arch: $cc not found"
+            continue
+        fi
         if [[ "$arch" == "$HOST_ARCH" ]]; then
             test_arches+=("$arch")
-        elif command -v "$cc" &>/dev/null; then
-            # Also need QEMU user-mode for non-native arches
+        else
+            # Non-native arch also needs QEMU user-mode
             local qemu="${QEMU_USER[$arch]:-}"
             if [[ -n "$qemu" ]] && command -v "$qemu" &>/dev/null; then
                 test_arches+=("$arch")
             else
-                warn "Skipping $arch: cross-compiler found but QEMU user-mode not found"
+                warn "Skipping $arch: compiler found but QEMU user-mode not found"
             fi
-        else
-            warn "Skipping $arch: $cc not installed"
         fi
     done
 
@@ -254,9 +315,8 @@ phase1_linux_tests() {
         local compile_fail=0
         for i in "${!TEST_NAMES[@]}"; do
             local name="${TEST_NAMES[$i]}"
-            local src="${TEST_SRCS[$i]}"
+            local src_path="${TEST_SRCS[$i]}"
             local ldflags="${TEST_LDFLAGS[$i]}"
-            local src_path="${SCRIPT_DIR}/${src}"
 
             if [[ ! -f "$src_path" ]]; then
                 err "Source not found: $src_path"
@@ -348,9 +408,8 @@ phase2_starryos_tests() {
 
     for i in "${!TEST_NAMES[@]}"; do
         local name="${TEST_NAMES[$i]}"
-        local src="${TEST_SRCS[$i]}"
+        local src_path="${TEST_SRCS[$i]}"
         local ldflags="${TEST_LDFLAGS[$i]}"
-        local src_path="${SCRIPT_DIR}/${src}"
 
         info "Compiling $name ($STARRY_ARCH, static) ..."
         if $cc -static -Wall -Wextra -O2 -o "${starry_build}/${name}" \
@@ -413,12 +472,20 @@ phase2_starryos_tests() {
     done
     ok "Test binaries copied to /bin/"
 
-    # Create the test runner script on rootfs
+    # Create the test runner script on rootfs (dynamically generated)
+    local runner_test_bins=""
+    for i in "${!TEST_NAMES[@]}"; do
+        runner_test_bins+="/bin/${TEST_NAMES[$i]} "
+    done
+
     sudo tee "${mountpoint}/bin/run_syscall_tests.sh" >/dev/null << 'RUNNER'
 #!/bin/sh
 # ──────────────────────────────────────────────
 #  Automated Syscall Test Runner for StarryOS
 # ──────────────────────────────────────────────
+
+PER_TEST_TIMEOUT=20
+
 echo ""
 echo "========================================="
 echo "  StarryOS Syscall Test Suite"
@@ -429,16 +496,32 @@ TOTAL=0
 PASSED=0
 FAILED=0
 
-for test_bin in /bin/test_brk /bin/test_mmap /bin/test_stat /bin/test_futex; do
+for test_bin in "$@"; do
     if [ -x "$test_bin" ]; then
         echo "--- Running $(basename $test_bin) ---"
         TOTAL=$((TOTAL + 1))
-        if $test_bin; then
+        timeout $PER_TEST_TIMEOUT "$test_bin"
+        rc=$?
+        if [ $rc -eq 0 ]; then
             PASSED=$((PASSED + 1))
             echo "--- $(basename $test_bin): PASSED ---"
+        elif [ $rc -eq 127 ] && [ "$(basename $test_bin)" = "timeout" ]; then
+            # timeout command not available — run without timeout
+            "$test_bin"
+            rc=$?
+            if [ $rc -eq 0 ]; then
+                PASSED=$((PASSED + 1))
+                echo "--- $(basename $test_bin): PASSED ---"
+            else
+                FAILED=$((FAILED + 1))
+                echo "--- $(basename $test_bin): FAILED (exit=$rc) ---"
+            fi
+        elif [ $rc -ge 128 ]; then
+            FAILED=$((FAILED + 1))
+            echo "--- $(basename $test_bin): TIMEOUT/KILLED (exit=$rc) ---"
         else
             FAILED=$((FAILED + 1))
-            echo "--- $(basename $test_bin): FAILED (exit=$?) ---"
+            echo "--- $(basename $test_bin): FAILED (exit=$rc) ---"
         fi
         echo ""
     else
@@ -457,14 +540,20 @@ RUNNER
     sudo mkdir -p "${mountpoint}/tmp"
     sudo chmod 1777 "${mountpoint}/tmp"
 
+    # Build the argument list for the runner
+    local runner_args=""
+    for i in "${!TEST_NAMES[@]}"; do
+        runner_args+="/bin/${TEST_NAMES[$i]} "
+    done
+
     # Create /root/.profile so the login shell auto-runs tests and exits.
     # The init.sh does: cd ~ && sh --login
     # BusyBox ash --login sources $HOME/.profile
-    sudo tee "${mountpoint}/root/.profile" >/dev/null << 'PROFILE'
+    sudo tee "${mountpoint}/root/.profile" >/dev/null << PROFILE
 #!/bin/sh
 echo ""
 echo "[auto-test] Running syscall tests from .profile ..."
-/bin/run_syscall_tests.sh
+/bin/run_syscall_tests.sh ${runner_args}
 echo ""
 echo "[auto-test] Tests complete. Exiting shell."
 exit 0
@@ -510,16 +599,14 @@ PROFILE
     local qemu_exit_code=0
 
     info "Launching StarryOS in QEMU (timeout: ${STARRY_TIMEOUT}s) ..."
-    info "Output will be captured to: $starry_output"
+    info "Output is displayed in real-time and captured to: $starry_output"
 
-    # Run StarryOS in QEMU with timeout
-    # Note: the kernel starts /bin/sh -c "init.sh" which runs sh --login,
-    # which sources .profile, which runs our tests and exits.
-    # After init exits, the kernel halts and QEMU should terminate.
+    # Run StarryOS in QEMU with timeout.
+    # tee shows output in real-time AND saves to log file.
     set +e
     ( cd "$TGOSKITS_DIR" && timeout "$STARRY_TIMEOUT" cargo starry qemu --arch "$STARRY_ARCH" ) \
-        > "$starry_output" 2>&1
-    qemu_exit_code=$?
+        2>&1 | tee "$starry_output"
+    qemu_exit_code=${PIPESTATUS[0]}
     set -e
 
     # Restore original rootfs
@@ -611,7 +698,7 @@ print_summary() {
 
     if $RUN_LINUX; then
         echo -e "${C_BOLD}Phase 1 — Linux Multi-Arch Tests:${C_RESET}"
-        for arch in x86_64 riscv64 aarch64; do
+        for arch in "${!LINUX_PASS[@]}" "${!LINUX_FAIL[@]}" "${!LINUX_SKIP[@]}"; do
             local p="${LINUX_PASS[$arch]:-0}"
             local f="${LINUX_FAIL[$arch]:-0}"
             local s="${LINUX_SKIP[$arch]:-0}"
@@ -685,6 +772,8 @@ main() {
     if ! $SKIP_DEP_CHECK; then
         check_prerequisites
     fi
+
+    discover_tests
 
     if $RUN_LINUX; then
         phase1_linux_tests
