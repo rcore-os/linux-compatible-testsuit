@@ -14,7 +14,7 @@ musl 交叉编译工具链,详见starryos仓库readme
 快速开始
 确保本仓库与 tgoskits（StarryOS）处于同一父目录：
 
-workspace/ ├── tgoskits/ # StarryOS 仓库 └── test/ # 本仓库
+workspace/ ├── tgoskits/ # StarryOS 仓库 └── linux-compatible-testsuit/ # 本仓库
 
 然后执行：
 
