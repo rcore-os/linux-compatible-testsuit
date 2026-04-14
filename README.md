@@ -3,7 +3,8 @@ Syscall Test Programs
 Linux 系统调用测试程序集，用于在 Linux 多架构环境及 StarryOS 上验证系统调用的正确性。
 
 仓库结构
-. ├── test_program/ # 测试源码目录（脚本自动扫描此目录下所有 .c 文件） │ ├── test_brk.c # brk / sbrk 系统调用测试 │ ├── test_stat.c # stat / lstat / fstat 系统调用测试 │ └── futex_test.c # futex 系统调用测试（含 pthread，自动检测） ├── run_all_tests.sh # 主测试脚本 └── README.md
+├── test_program/ # 测试源码目录（脚本自动扫描此目录下所有 .c 文件）  
+├── run_all_tests.sh # 主测试脚本 └── README.md  
 
 新增测试只需在 test_program/ 下放入 .c 文件，脚本会自动发现并编译运行。若源码中包含 pthread 相关调用，脚本会自动添加 -lpthread 并延长超时。
 
