@@ -698,7 +698,10 @@ print_summary() {
 
     if $RUN_LINUX; then
         echo -e "${C_BOLD}Phase 1 — Linux Multi-Arch Tests:${C_RESET}"
+        local -A seen_arches=()
         for arch in "${!LINUX_PASS[@]}" "${!LINUX_FAIL[@]}" "${!LINUX_SKIP[@]}"; do
+            [[ -n "${seen_arches[$arch]:-}" ]] && continue
+            seen_arches[$arch]=1
             local p="${LINUX_PASS[$arch]:-0}"
             local f="${LINUX_FAIL[$arch]:-0}"
             local s="${LINUX_SKIP[$arch]:-0}"
