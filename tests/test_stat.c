@@ -8,9 +8,36 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+/*
+ * Some musl cross toolchains do not expose statx() in <sys/stat.h>.
+ * Fall back to the raw syscall while reusing the kernel UAPI layout.
+ */
+#if !defined(__GLIBC__)
+#include <linux/stat.h>
+
+static int statx_compat(int dirfd, const char *pathname, int flags,
+                        unsigned int mask, struct statx *buf)
+{
+#ifdef __NR_statx
+    return syscall(__NR_statx, dirfd, pathname, flags, mask, buf);
+#else
+    (void)dirfd;
+    (void)pathname;
+    (void)flags;
+    (void)mask;
+    (void)buf;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+#define statx(...) statx_compat(__VA_ARGS__)
+#endif
 
 /* ---------------------------------------------------------------------------
  * Custom assertion macro: prints file/line/expected/actual on failure

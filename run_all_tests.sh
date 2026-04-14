@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# run_all_tests.sh - Compile and run C syscall test programs on Linux (multi-arch)
-#                    and on StarryOS
+# run_all_tests.sh - Build and run Linux syscall compatibility tests
+#                    on native/cross Linux and on StarryOS.
 #
 # Usage:
 #   ./run_all_tests.sh [OPTIONS]
 #
 # Options:
-#   --linux-only          Only run Phase 1 (Linux multi-arch tests)
+#   --linux-only          Only run Phase 1 (Linux tests)
 #   --starry-only         Only run Phase 2 (StarryOS tests)
-#   --starry-arch ARCH    Target architecture for StarryOS (default: riscv64)
+#   --starry-arch ARCH    Target architecture for StarryOS (default: x86_64)
 #   --tgoskits DIR        Path to tgoskits repo (default: auto-detect ../tgoskits)
 #   --no-dep-check        Skip dependency checking
 #   -h, --help            Show this help message
@@ -17,12 +17,12 @@
 # Environment variables:
 #   TGOSKITS_DIR       Path to tgoskits repo
 #   STARRY_ARCH        Default StarryOS target arch
-#   STARRY_TIMEOUT     Per-test QEMU timeout in seconds (default: 60)
+#   STARRY_TIMEOUT     StarryOS QEMU timeout in seconds (default: 90)
+#   MUSL_CC            Override x86_64 musl compiler (e.g. x86_64-linux-musl-gcc)
 #
 # Prerequisites (Ubuntu/Debian):
-#   sudo apt install gcc-riscv64-linux-gnu gcc-aarch64-linux-gnu \
-#                    qemu-user-static qemu-system-misc rustc cargo \
-#                    sudo e2fsprogs
+#   sudo apt install musl-tools gcc-riscv64-linux-gnu gcc-aarch64-linux-gnu \
+#                    qemu-user-static qemu-system-misc rustc cargo e2fsprogs
 #
 
 set -euo pipefail
@@ -33,8 +33,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TGOSKITS_DIR="${TGOSKITS_DIR:-}"
-STARRY_ARCH="${STARRY_ARCH:-riscv64}"
-STARRY_TIMEOUT="${STARRY_TIMEOUT:-60}"
+STARRY_ARCH="${STARRY_ARCH:-x86_64}"
+STARRY_TIMEOUT="${STARRY_TIMEOUT:-90}"
+MUSL_CC="${MUSL_CC:-}"
 HOST_ARCH="$(uname -m)"
 [[ "$HOST_ARCH" == "amd64" ]] && HOST_ARCH="x86_64"
 
@@ -79,7 +80,7 @@ declare -a TEST_SRCS=(
     "tests/test_accept4.c"
 )
 declare -a TEST_LDFLAGS=("" "" "" "" "" "" "" "" "" "")
-declare -a TEST_TIMEOUTS=(30 30 30 30 60 30 30 30 30 30)  # Per-test timeout in seconds
+declare -a TEST_TIMEOUTS=(30 30 30 30 60 30 30 30 30 30)
 
 # Cross-compiler command per architecture
 declare -A CROSS_CC=(
@@ -109,8 +110,11 @@ BUILD_DIR="${SCRIPT_DIR}/build"
 LOG_DIR="${SCRIPT_DIR}/logs"
 
 # Result tracking
-declare -A LINUX_PASS LINUX_FAIL LINUX_SKIP
+declare -A LINUX_PASS LINUX_FAIL LINUX_SKIP LINUX_TEST_STATUS
+declare -A STARRY_TEST_STATUS STARRY_TEST_RC
 STARRY_TOTAL_PASS=0; STARRY_TOTAL_FAIL=0; STARRY_TOTAL_SKIP=0
+STARRY_COMPAT_MISMATCH=0
+X86_64_MUSL_CC=""
 
 # ============================================================
 #  Argument Parsing
@@ -146,27 +150,214 @@ if [[ -z "$TGOSKITS_DIR" ]]; then
 fi
 
 # ============================================================
-#  Cleanup
+#  Helpers
 # ============================================================
 
-# Tracks resources to clean up on exit
-_CLEANUP_MOUNTS=()
-_CLEANUP_FILES=()
+detect_x86_64_musl_cc() {
+    local -a candidates=()
 
-cleanup() {
-    # Unmount any leftover mounts
-    for mp in "${_CLEANUP_MOUNTS[@]+"${_CLEANUP_MOUNTS[@]}"}"; do
-        if mountpoint -q "$mp" 2>/dev/null; then
-            sudo umount "$mp" 2>/dev/null || true
+    if [[ -n "$MUSL_CC" ]]; then
+        candidates+=("$MUSL_CC")
+    fi
+    candidates+=("x86_64-linux-musl-gcc" "musl-gcc")
+
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if command -v "$candidate" &>/dev/null; then
+            printf '%s\n' "$candidate"
+            return 0
         fi
-        rmdir "$mp" 2>/dev/null || true
     done
-    # Remove temp files
-    for f in "${_CLEANUP_FILES[@]+"${_CLEANUP_FILES[@]}"}"; do
-        rm -f "$f" 2>/dev/null || true
+    return 1
+}
+
+compiler_for_arch() {
+    local arch="$1"
+
+    if [[ "$arch" == "x86_64" && -n "$X86_64_MUSL_CC" ]]; then
+        printf '%s\n' "$X86_64_MUSL_CC"
+    else
+        printf '%s\n' "${CROSS_CC[$arch]:-}"
+    fi
+}
+
+compiler_desc_for_arch() {
+    local arch="$1"
+    local cc
+    cc="$(compiler_for_arch "$arch")"
+
+    if [[ "$arch" == "x86_64" && -n "$X86_64_MUSL_CC" ]]; then
+        printf '%s (musl)' "$cc"
+    else
+        printf '%s' "$cc"
+    fi
+}
+
+need_x86_64_musl_cc() {
+    [[ "$HOST_ARCH" == "x86_64" && "$RUN_LINUX" == true ]] || \
+    [[ "$STARRY_ARCH" == "x86_64" && "$RUN_STARRY" == true ]]
+}
+
+compile_one_test() {
+    local arch="$1"
+    local src_path="$2"
+    local output_path="$3"
+    local compile_log="$4"
+    local ldflags="$5"
+
+    local cc
+    cc="$(compiler_for_arch "$arch")"
+    if [[ -z "$cc" ]] || ! command -v "$cc" &>/dev/null; then
+        return 127
+    fi
+
+    local -a extra_ldflags=()
+    if [[ -n "$ldflags" ]]; then
+        read -r -a extra_ldflags <<< "$ldflags"
+    fi
+
+    "$cc" -static -Wall -Wextra -O2 -o "$output_path" "$src_path" "${extra_ldflags[@]}" \
+        >"$compile_log" 2>&1
+}
+
+escape_sed_replacement() {
+    printf '%s' "$1" | sed 's/[\/&]/\\&/g'
+}
+
+write_starry_runner_script() {
+    local runner_path="$1"
+    local test_paths
+    test_paths=$(printf '/bin/%s ' "${TEST_NAMES[@]}")
+
+    cat >"$runner_path" <<RUNNER
+#!/bin/sh
+
+echo
+echo "@@@ STARRY_TEST_SUITE_BEGIN @@@"
+echo
+
+TOTAL=0
+PASSED=0
+FAILED=0
+
+for test_bin in ${test_paths}; do
+    name=\${test_bin##*/}
+    TOTAL=\$((TOTAL + 1))
+
+    echo "@@@ STARRY_TEST_BEGIN \${name} @@@"
+    "\$test_bin"
+    rc=\$?
+
+    if [ "\$rc" -eq 0 ]; then
+        PASSED=\$((PASSED + 1))
+        echo "@@@ STARRY_TEST_RESULT \${name} PASS rc=\${rc} @@@"
+    else
+        FAILED=\$((FAILED + 1))
+        echo "@@@ STARRY_TEST_RESULT \${name} FAIL rc=\${rc} @@@"
+    fi
+    echo
+done
+
+echo "@@@ STARRY_TEST_SUMMARY total=\${TOTAL} passed=\${PASSED} failed=\${FAILED} @@@"
+if [ "\$FAILED" -eq 0 ]; then
+    echo "@@@ STARRY_TEST_SUITE PASS @@@"
+    exit 0
+else
+    echo "@@@ STARRY_TEST_SUITE FAIL @@@"
+    exit 1
+fi
+RUNNER
+
+    chmod 0755 "$runner_path"
+}
+
+inject_files_into_rootfs() {
+    local rootfs_img="$1"
+    local debugfs_cmds="$2"
+    local log_file="$3"
+
+    if debugfs -w -f "$debugfs_cmds" "$rootfs_img" >"$log_file" 2>&1; then
+        return 0
+    fi
+
+    cat "$log_file"
+    return 1
+}
+
+prepare_starry_rootfs_copy() {
+    local base_rootfs="$1"
+    local work_rootfs="$2"
+    local starry_build="$3"
+
+    cp "$base_rootfs" "$work_rootfs"
+
+    local runner_path="${starry_build}/run_syscall_tests.sh"
+    local debugfs_cmds="${starry_build}/inject_rootfs.cmds"
+    local inject_log="${starry_build}/inject_rootfs.log"
+
+    write_starry_runner_script "$runner_path"
+
+    {
+        echo "write ${runner_path} /bin/run_syscall_tests.sh"
+        echo "sif /bin/run_syscall_tests.sh mode 0100755"
+        local name
+        for name in "${TEST_NAMES[@]}"; do
+            echo "write ${starry_build}/${name} /bin/${name}"
+            echo "sif /bin/${name} mode 0100755"
+        done
+    } >"$debugfs_cmds"
+
+    inject_files_into_rootfs "$work_rootfs" "$debugfs_cmds" "$inject_log"
+}
+
+generate_starry_qemu_config() {
+    local template_path="$1"
+    local output_path="$2"
+    local disk_img="$3"
+
+    local escaped_disk
+    escaped_disk="$(escape_sed_replacement "$disk_img")"
+
+    sed \
+        -e "s|\"id=disk0,if=none,format=raw,file=.*\"|\"id=disk0,if=none,format=raw,file=${escaped_disk}\"|" \
+        -e 's|^shell_init_cmd = .*|shell_init_cmd = "/bin/run_syscall_tests.sh"|' \
+        -e 's|^success_regex = .*|success_regex = ["(?m)^@@@ STARRY_TEST_SUITE PASS @@@\\\\s*$"]|' \
+        -e 's|^fail_regex = .*|fail_regex = ["(?m)^@@@ STARRY_TEST_SUITE FAIL @@@\\\\s*$", "(?i)\\\\bpanic(?:ked)?\\\\b"]|' \
+        -e "s|^timeout = .*|timeout = ${STARRY_TIMEOUT}|" \
+        "$template_path" >"$output_path"
+}
+
+summarize_log_tail() {
+    local log_file="$1"
+    if [[ -f "$log_file" ]]; then
+        tail -20 "$log_file" || true
+    fi
+}
+
+compare_starry_with_linux_reference() {
+    if ! $RUN_LINUX; then
+        return 0
+    fi
+
+    if [[ -z "${LINUX_TEST_STATUS["x86_64:${TEST_NAMES[0]}"]:-}" ]]; then
+        return 0
+    fi
+
+    section "StarryOS vs Linux/x86_64 Reference"
+
+    local name
+    for name in "${TEST_NAMES[@]}"; do
+        local linux_status="${LINUX_TEST_STATUS["x86_64:${name}"]:-unknown}"
+        local starry_status="${STARRY_TEST_STATUS[$name]:-unknown}"
+
+        if [[ "$linux_status" == "$starry_status" ]]; then
+            ok "$name matches Linux reference ($linux_status)"
+        else
+            err "$name differs from Linux reference (linux=$linux_status, starry=$starry_status)"
+            ((STARRY_COMPAT_MISMATCH++))
+        fi
     done
 }
-trap cleanup EXIT
 
 # ============================================================
 #  Prerequisites Check
@@ -176,18 +367,24 @@ check_prerequisites() {
     header "Checking Prerequisites"
 
     local missing=()
+    X86_64_MUSL_CC="$(detect_x86_64_musl_cc || true)"
 
     # Basic tools
-    for cmd in gcc make; do
+    local cmd
+    for cmd in gcc make timeout sed grep debugfs; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
 
+    if need_x86_64_musl_cc && [[ -z "$X86_64_MUSL_CC" ]]; then
+        missing+=("x86_64 musl gcc (set MUSL_CC or install x86_64-linux-musl-gcc / musl-gcc)")
+    fi
+
     # QEMU user-mode for cross-arch Linux testing
+    local arch
     for arch in riscv64 aarch64; do
         if command -v "${QEMU_USER[$arch]}" &>/dev/null; then
-            : # available
+            :
         elif command -v "${QEMU_USER[$arch]/-static/}" &>/dev/null; then
-            # Some distros install without -static suffix
             QEMU_USER[$arch]="${QEMU_USER[$arch]/-static/}"
         else
             warn "QEMU user-mode for $arch not found — that arch will be skipped"
@@ -196,7 +393,6 @@ check_prerequisites() {
 
     if $RUN_STARRY; then
         command -v cargo &>/dev/null || missing+=("cargo (Rust toolchain)")
-        command -v sudo &>/dev/null   || missing+=("sudo")
 
         local qemu_sys="qemu-system-${STARRY_ARCH}"
         if ! command -v "$qemu_sys" &>/dev/null; then
@@ -216,9 +412,8 @@ check_prerequisites() {
         printf '    - %s\n' "${missing[@]}"
         echo ""
         info "Install on Ubuntu/Debian:"
-        echo "  sudo apt install gcc-riscv64-linux-gnu gcc-aarch64-linux-gnu \\"
-        echo "       qemu-user-static qemu-system-misc qemu-system-arm \\"
-        echo "       rustc cargo sudo e2fsprogs"
+        echo "  sudo apt install musl-tools gcc-riscv64-linux-gnu gcc-aarch64-linux-gnu \\"
+        echo "       qemu-user-static qemu-system-misc rustc cargo e2fsprogs"
         exit 1
     fi
 
@@ -227,6 +422,9 @@ check_prerequisites() {
         info "tgoskits: $TGOSKITS_DIR"
     fi
     info "host arch: $HOST_ARCH"
+    if [[ -n "$X86_64_MUSL_CC" ]]; then
+        info "x86_64 musl compiler: $X86_64_MUSL_CC"
+    fi
 }
 
 # ============================================================
@@ -237,14 +435,18 @@ phase1_linux_tests() {
     header "Phase 1: Linux Multi-Architecture Tests"
     mkdir -p "$BUILD_DIR" "$LOG_DIR"
 
-    # Determine which architectures we can test
     local -a test_arches=()
+    local arch
     for arch in x86_64 riscv64 aarch64; do
-        local cc="${CROSS_CC[$arch]}"
+        local cc
+        cc="$(compiler_for_arch "$arch")"
         if [[ "$arch" == "$HOST_ARCH" ]]; then
-            test_arches+=("$arch")
-        elif command -v "$cc" &>/dev/null; then
-            # Also need QEMU user-mode for non-native arches
+            if [[ -n "$cc" ]] && command -v "$cc" &>/dev/null; then
+                test_arches+=("$arch")
+            else
+                warn "Skipping $arch: compiler $(compiler_desc_for_arch "$arch") not found"
+            fi
+        elif [[ -n "$cc" ]] && command -v "$cc" &>/dev/null; then
             local qemu="${QEMU_USER[$arch]:-}"
             if [[ -n "$qemu" ]] && command -v "$qemu" &>/dev/null; then
                 test_arches+=("$arch")
@@ -252,7 +454,7 @@ phase1_linux_tests() {
                 warn "Skipping $arch: cross-compiler found but QEMU user-mode not found"
             fi
         else
-            warn "Skipping $arch: $cc not installed"
+            warn "Skipping $arch: compiler $(compiler_desc_for_arch "$arch") not installed"
         fi
     done
 
@@ -263,37 +465,37 @@ phase1_linux_tests() {
 
     info "Will test on: ${test_arches[*]}"
 
-    # Test each architecture
     for arch in "${test_arches[@]}"; do
         section "Linux/$arch"
         local arch_build="${BUILD_DIR}/linux_${arch}"
         local arch_log="${LOG_DIR}/linux_${arch}"
-        mkdir -p "$arch_build"
+        mkdir -p "$arch_build" "$arch_log"
 
-        # Select compiler
-        local cc="${CROSS_CC[$arch]}"
+        info "Compiler: $(compiler_desc_for_arch "$arch")"
 
-        # --- Compile ---
         local compile_fail=0
+        local i
         for i in "${!TEST_NAMES[@]}"; do
             local name="${TEST_NAMES[$i]}"
             local src="${TEST_SRCS[$i]}"
             local ldflags="${TEST_LDFLAGS[$i]}"
             local src_path="${SCRIPT_DIR}/${src}"
+            local compile_log="${arch_log}/${name}_compile.log"
 
             if [[ ! -f "$src_path" ]]; then
                 err "Source not found: $src_path"
+                LINUX_TEST_STATUS["$arch:$name"]="skip"
                 compile_fail=1
                 continue
             fi
 
             info "Compiling $name ($arch) ..."
-            if $cc -static -Wall -Wextra -O2 -o "${arch_build}/${name}" \
-                   "$src_path" $ldflags 2>"${arch_log}_${name}_compile.log"; then
+            if compile_one_test "$arch" "$src_path" "${arch_build}/${name}" "$compile_log" "$ldflags"; then
                 ok "Built $name"
             else
                 err "Compile failed: $name ($arch)"
-                cat "${arch_log}_${name}_compile.log"
+                cat "$compile_log"
+                LINUX_TEST_STATUS["$arch:$name"]="fail"
                 compile_fail=1
             fi
         done
@@ -303,42 +505,42 @@ phase1_linux_tests() {
             continue
         fi
 
-        # --- Run ---
         for i in "${!TEST_NAMES[@]}"; do
             local name="${TEST_NAMES[$i]}"
             local binary="${arch_build}/${name}"
             local test_timeout="${TEST_TIMEOUTS[$i]}"
+            local log_file="${arch_log}/${name}_run.log"
 
             if [[ ! -f "$binary" ]]; then
                 warn "SKIP $name ($arch): binary not found"
                 LINUX_SKIP[$arch]=$((${LINUX_SKIP[$arch]:-0} + 1))
+                LINUX_TEST_STATUS["$arch:$name"]="skip"
                 continue
             fi
 
             info "Running $name on Linux/$arch (timeout: ${test_timeout}s) ..."
 
-            # Build run command
-            local run_cmd
-            if [[ "$arch" == "$HOST_ARCH" ]]; then
-                run_cmd="$binary"
-            else
-                run_cmd="${QEMU_USER[$arch]} $binary"
-            fi
-
-            local log_file="${arch_log}_${name}_run.log"
             local exit_code=0
-            timeout "$test_timeout" $run_cmd >"$log_file" 2>&1 || exit_code=$?
+            if [[ "$arch" == "$HOST_ARCH" ]]; then
+                timeout "$test_timeout" "$binary" >"$log_file" 2>&1 || exit_code=$?
+            else
+                timeout "$test_timeout" "${QEMU_USER[$arch]}" "$binary" >"$log_file" 2>&1 || exit_code=$?
+            fi
 
             if [[ $exit_code -eq 0 ]]; then
                 ok "PASS  $name ($arch)"
                 LINUX_PASS[$arch]=$((${LINUX_PASS[$arch]:-0} + 1))
+                LINUX_TEST_STATUS["$arch:$name"]="pass"
             elif [[ $exit_code -eq 124 ]]; then
                 err "TIMEOUT $name ($arch)"
                 LINUX_FAIL[$arch]=$((${LINUX_FAIL[$arch]:-0} + 1))
+                LINUX_TEST_STATUS["$arch:$name"]="fail"
+                summarize_log_tail "$log_file"
             else
                 err "FAIL  $name ($arch) — exit code $exit_code"
                 LINUX_FAIL[$arch]=$((${LINUX_FAIL[$arch]:-0} + 1))
-                tail -20 "$log_file"
+                LINUX_TEST_STATUS["$arch:$name"]="fail"
+                summarize_log_tail "$log_file"
             fi
             echo ""
         done
@@ -355,12 +557,18 @@ phase2_starryos_tests() {
 
     local starry_build="${BUILD_DIR}/starry_${STARRY_ARCH}"
     local starry_log="${LOG_DIR}/starry_${STARRY_ARCH}"
-    mkdir -p "$starry_build"
+    mkdir -p "$starry_build" "$starry_log"
 
-    local cc="${CROSS_CC[$STARRY_ARCH]:-}"
+    local cc
+    cc="$(compiler_for_arch "$STARRY_ARCH")"
     if [[ -z "$cc" ]] || ! command -v "$cc" &>/dev/null; then
-        err "Cross-compiler for $STARRY_ARCH not found"
-        err "Install: sudo apt install gcc-${STARRY_ARCH}-linux-gnu"
+        err "Compiler for $STARRY_ARCH not found: $(compiler_desc_for_arch "$STARRY_ARCH")"
+        return 1
+    fi
+
+    local target_triple="${STARRY_TARGET[$STARRY_ARCH]:-}"
+    if [[ -z "$target_triple" ]]; then
+        err "Unsupported StarryOS architecture: $STARRY_ARCH"
         return 1
     fi
 
@@ -368,200 +576,93 @@ phase2_starryos_tests() {
     #  Step 1: Cross-compile test programs as static binaries
     # ----------------------------------------------------------
     section "Step 1/4: Cross-compile for StarryOS/$STARRY_ARCH"
+    info "Compiler: $(compiler_desc_for_arch "$STARRY_ARCH")"
 
+    local i
     for i in "${!TEST_NAMES[@]}"; do
         local name="${TEST_NAMES[$i]}"
         local src="${TEST_SRCS[$i]}"
         local ldflags="${TEST_LDFLAGS[$i]}"
         local src_path="${SCRIPT_DIR}/${src}"
+        local compile_log="${starry_log}/${name}_compile.log"
 
         info "Compiling $name ($STARRY_ARCH, static) ..."
-        if $cc -static -Wall -Wextra -O2 -o "${starry_build}/${name}" \
-               "$src_path" $ldflags 2>"${starry_log}_${name}_compile.log"; then
+        if compile_one_test "$STARRY_ARCH" "$src_path" "${starry_build}/${name}" "$compile_log" "$ldflags"; then
             ok "Built $name for StarryOS"
         else
             err "Compile failed: $name"
-            cat "${starry_log}_${name}_compile.log"
+            cat "$compile_log"
             return 1
         fi
     done
 
     # ----------------------------------------------------------
-    #  Step 2: Download rootfs and inject test binaries
+    #  Step 2: Prepare isolated rootfs copy and inject binaries
     # ----------------------------------------------------------
-    section "Step 2/4: Prepare rootfs with test binaries"
+    section "Step 2/4: Prepare isolated rootfs"
 
-    info "Downloading rootfs (if not cached) ..."
+    info "Ensuring StarryOS rootfs is available ..."
     (
         cd "$TGOSKITS_DIR"
         cargo starry rootfs --arch "$STARRY_ARCH"
     )
-    ok "Rootfs downloaded"
+    ok "Rootfs ready"
 
-    local target_triple="${STARRY_TARGET[$STARRY_ARCH]}"
     local rootfs="${TGOSKITS_DIR}/target/${target_triple}/rootfs-${STARRY_ARCH}.img"
-
     if [[ ! -f "$rootfs" ]]; then
         err "Rootfs not found: $rootfs"
         return 1
     fi
 
-    # Make a working copy so we don't corrupt the cached original
-    local work_rootfs="${starry_build}/rootfs-${STARRY_ARCH}.img"
-    info "Creating working copy of rootfs ..."
-    cp "$rootfs" "$work_rootfs"
-    _CLEANUP_FILES+=("$work_rootfs")
-    ok "Working copy: $work_rootfs"
-
-    # Resize to fit test binaries (~64 MB extra)
-    info "Resizing rootfs ..."
-    truncate -s +64M "$work_rootfs"
-    e2fsck -fy "$work_rootfs" &>/dev/null || true
-    resize2fs "$work_rootfs" &>/dev/null
-    ok "Resized"
-
-    # Mount and inject
-    info "Mounting rootfs and injecting test binaries ..."
-    local mountpoint="/tmp/starry_rootfs_${STARRY_ARCH}_$$"
-    mkdir -p "$mountpoint"
-    _CLEANUP_MOUNTS+=("$mountpoint")
-
-    sudo mount -o loop "$work_rootfs" "$mountpoint"
-
-    # Copy test binaries
-    for i in "${!TEST_NAMES[@]}"; do
-        local name="${TEST_NAMES[$i]}"
-        sudo cp "${starry_build}/${name}" "${mountpoint}/bin/${name}"
-        sudo chmod 0755 "${mountpoint}/bin/${name}"
-    done
-    ok "Test binaries copied to /bin/"
-
-    # Create the test runner script on rootfs
-    local runner_tests
-    runner_tests=$(printf '/bin/%s ' "${TEST_NAMES[@]}")
-
-    sudo tee "${mountpoint}/bin/run_syscall_tests.sh" >/dev/null <<RUNNER
-#!/bin/sh
-# ──────────────────────────────────────────────
-#  Automated Syscall Test Runner for StarryOS
-# ──────────────────────────────────────────────
-echo ""
-echo "========================================="
-echo "  StarryOS Syscall Test Suite"
-echo "========================================="
-echo ""
-
-TOTAL=0
-PASSED=0
-FAILED=0
-
-for test_bin in ${runner_tests}; do
-    if [ -x "$test_bin" ]; then
-        echo "--- Running $(basename $test_bin) ---"
-        TOTAL=$((TOTAL + 1))
-        if $test_bin; then
-            PASSED=$((PASSED + 1))
-            echo "--- $(basename $test_bin): PASSED ---"
-        else
-            FAILED=$((FAILED + 1))
-            echo "--- $(basename $test_bin): FAILED (exit=$?) ---"
-        fi
-        echo ""
+    local work_rootfs="${starry_build}/rootfs-${STARRY_ARCH}-tests.img"
+    info "Creating isolated rootfs copy: $work_rootfs"
+    if prepare_starry_rootfs_copy "$rootfs" "$work_rootfs" "$starry_build"; then
+        ok "Injected runner and test binaries into isolated rootfs"
     else
-        echo "--- SKIP $(basename $test_bin) (not found) ---"
-    fi
-done
-
-echo "========================================="
-echo "  RESULTS: $PASSED/$TOTAL passed, $FAILED failed"
-echo "========================================="
-RUNNER
-    sudo chmod 0755 "${mountpoint}/bin/run_syscall_tests.sh"
-    ok "Test runner script installed to /bin/run_syscall_tests.sh"
-
-    # Ensure /tmp exists (some tests create temp files there)
-    sudo mkdir -p "${mountpoint}/tmp"
-    sudo chmod 1777 "${mountpoint}/tmp"
-
-    # Create /root/.profile so the login shell auto-runs tests and exits.
-    # The init.sh does: cd ~ && sh --login
-    # BusyBox ash --login sources $HOME/.profile
-    sudo tee "${mountpoint}/root/.profile" >/dev/null << 'PROFILE'
-#!/bin/sh
-echo ""
-echo "[auto-test] Running syscall tests from .profile ..."
-/bin/run_syscall_tests.sh
-echo ""
-echo "[auto-test] Tests complete. Exiting shell."
-exit 0
-PROFILE
-    sudo chmod 0755 "${mountpoint}/root/.profile"
-    ok "Auto-test .profile installed"
-
-    # Unmount
-    sudo umount "$mountpoint"
-    rmdir "$mountpoint"
-    # Remove from cleanup list since we already cleaned up
-    _CLEANUP_MOUNTS=()
-    ok "Rootfs prepared and unmounted"
-
-    # ----------------------------------------------------------
-    #  Step 3: Build StarryOS kernel
-    # ----------------------------------------------------------
-    section "Step 3/4: Build StarryOS kernel ($STARRY_ARCH)"
-
-    info "Building StarryOS (this may take a while) ..."
-    if ( cd "$TGOSKITS_DIR" && cargo starry build --arch "$STARRY_ARCH" ); then
-        ok "StarryOS kernel built"
-    else
-        err "StarryOS kernel build failed"
+        err "Failed to inject files into rootfs"
         return 1
     fi
 
     # ----------------------------------------------------------
-    #  Step 4: Run StarryOS in QEMU with injected rootfs
+    #  Step 3: Generate dedicated QEMU config for this run
+    # ----------------------------------------------------------
+    section "Step 3/4: Generate dedicated QEMU config"
+
+    local qemu_template="${TGOSKITS_DIR}/test-suit/starryos/qemu-${STARRY_ARCH}.toml"
+    local qemu_config="${starry_build}/qemu-${STARRY_ARCH}-syscall-tests.toml"
+    if [[ ! -f "$qemu_template" ]]; then
+        err "QEMU template not found: $qemu_template"
+        return 1
+    fi
+
+    generate_starry_qemu_config "$qemu_template" "$qemu_config" "$work_rootfs"
+    ok "Generated test QEMU config: $qemu_config"
+
+    # ----------------------------------------------------------
+    #  Step 4: Build and run StarryOS in QEMU
     # ----------------------------------------------------------
     section "Step 4/4: Run tests on StarryOS ($STARRY_ARCH)"
 
-    # We need to run QEMU with our modified rootfs instead of the default one.
-    # Strategy: temporarily replace the default rootfs with our working copy,
-    # then run `cargo starry qemu`, then restore.
-    info "Swapping rootfs with test-injected version ..."
-    local original_rootfs_backup="${rootfs}.original_backup"
-    cp "$rootfs" "$original_rootfs_backup"
-    _CLEANUP_FILES+=("$original_rootfs_backup")
-    cp "$work_rootfs" "$rootfs"
-
-    local starry_output="${starry_log}_qemu_output.log"
+    local starry_output="${starry_log}/qemu_output.log"
     local qemu_exit_code=0
 
     info "Launching StarryOS in QEMU (timeout: ${STARRY_TIMEOUT}s) ..."
     info "Output will be captured to: $starry_output"
 
-    # Run StarryOS in QEMU with timeout
-    # Note: the kernel starts /bin/sh -c "init.sh" which runs sh --login,
-    # which sources .profile, which runs our tests and exits.
-    # After init exits, the kernel halts and QEMU should terminate.
     set +e
-    ( cd "$TGOSKITS_DIR" && timeout "$STARRY_TIMEOUT" cargo starry qemu --arch "$STARRY_ARCH" ) \
-        > "$starry_output" 2>&1
+    (
+        cd "$TGOSKITS_DIR"
+        timeout "$STARRY_TIMEOUT" cargo starry qemu --arch "$STARRY_ARCH" --qemu-config "$qemu_config"
+    ) >"$starry_output" 2>&1
     qemu_exit_code=$?
     set -e
 
-    # Restore original rootfs
-    info "Restoring original rootfs ..."
-    cp "$original_rootfs_backup" "$rootfs"
-    rm -f "$original_rootfs_backup"
-    ok "Original rootfs restored"
-
-    # ----------------------------------------------------------
-    #  Parse results
-    # ----------------------------------------------------------
     section "StarryOS Test Results"
 
     if [[ $qemu_exit_code -eq 124 ]]; then
         warn "QEMU timed out after ${STARRY_TIMEOUT}s"
-        warn "Some tests may not have completed"
+    elif [[ $qemu_exit_code -ne 0 ]]; then
+        warn "cargo starry qemu exited with code $qemu_exit_code"
     fi
 
     if [[ ! -s "$starry_output" ]]; then
@@ -569,63 +670,64 @@ PROFILE
         return 1
     fi
 
-    # Display relevant output sections
     echo ""
-    echo "--- StarryOS serial output (test-related) ---"
-    # Extract everything between our test markers
-    sed -n '/StarryOS Syscall Test Suite/,/RESULTS:/p' "$starry_output" || true
-    echo "--- End of test output ---"
+    echo "--- StarryOS serial output (markers) ---"
+    grep '@@@ STARRY_TEST_' "$starry_output" || true
+    echo "--- End of markers ---"
     echo ""
 
-    # Parse results
-    local results_line
-    results_line=$(grep -oP 'RESULTS: \d+/\d+ passed, \d+ failed' "$starry_output" 2>/dev/null || true)
-    if [[ -n "$results_line" ]]; then
-        info "$results_line"
+    local summary_line
+    summary_line=$(grep -oE '@@@ STARRY_TEST_SUMMARY total=[0-9]+ passed=[0-9]+ failed=[0-9]+ @@@' \
+        "$starry_output" | tail -1 || true)
 
-        # Extract counts
-        local passed total failed
-        passed=$(echo "$results_line" | grep -oP '\d+(?=/)' || echo "0")
-        total=$(echo "$results_line" | grep -oP '\d+(?= passed)' || echo "0")
-        failed=$(echo "$results_line" | grep -oP '\d+(?= failed)' || echo "0")
-
-        STARRY_TOTAL_PASS=$passed
-        STARRY_TOTAL_FAIL=$failed
+    if [[ -n "$summary_line" ]]; then
+        local total passed failed
+        total=$(echo "$summary_line" | grep -oE 'total=[0-9]+' | cut -d= -f2)
+        passed=$(echo "$summary_line" | grep -oE 'passed=[0-9]+' | cut -d= -f2)
+        failed=$(echo "$summary_line" | grep -oE 'failed=[0-9]+' | cut -d= -f2)
+        STARRY_TOTAL_PASS="$passed"
+        STARRY_TOTAL_FAIL="$failed"
         STARRY_TOTAL_SKIP=$(( ${#TEST_NAMES[@]} - total ))
-
-        if [[ "$failed" -eq 0 ]] && [[ "$total" -gt 0 ]]; then
-            ok "All StarryOS tests PASSED ($passed/$total)"
-        else
-            err "Some StarryOS tests FAILED ($failed/$total)"
-        fi
+        info "$summary_line"
     else
-        warn "Could not parse test results from output"
-        warn "Full log: $starry_output"
-
-        # Fall back: look for individual test markers
-        local found_any=false
-        for i in "${!TEST_NAMES[@]}"; do
-            local name="${TEST_NAMES[$i]}"
-            if grep -q "--- Running ${name} ---" "$starry_output" 2>/dev/null; then
-                found_any=true
-                if grep -q "--- ${name}: PASSED ---" "$starry_output" 2>/dev/null; then
-                    ok "StarryOS: $name PASSED"
-                    ((STARRY_TOTAL_PASS++))
-                elif grep -q "--- ${name}: FAILED ---" "$starry_output" 2>/dev/null; then
-                    err "StarryOS: $name FAILED"
-                    ((STARRY_TOTAL_FAIL++))
-                else
-                    warn "StarryOS: $name — unknown result"
-                    ((STARRY_TOTAL_SKIP++))
-                fi
-            else
-                warn "StarryOS: $name — not executed"
-                ((STARRY_TOTAL_SKIP++))
-            fi
-        done
+        warn "Could not parse StarryOS summary marker"
     fi
 
+    local name
+    for name in "${TEST_NAMES[@]}"; do
+        local line
+        line=$(grep -E "@@@ STARRY_TEST_RESULT ${name} (PASS|FAIL) rc=[0-9]+ @@@" \
+            "$starry_output" | tail -1 || true)
+
+        if [[ -z "$line" ]]; then
+            STARRY_TEST_STATUS["$name"]="skip"
+            STARRY_TEST_RC["$name"]="-"
+            if [[ -z "$summary_line" ]]; then
+                ((STARRY_TOTAL_SKIP++))
+            fi
+            warn "StarryOS: $name not observed in serial log"
+            continue
+        fi
+
+        local status rc
+        status=$(echo "$line" | awk '{print $4}')
+        rc=$(echo "$line" | awk '{print $5}' | cut -d= -f2)
+        STARRY_TEST_RC["$name"]="$rc"
+
+        if [[ "$status" == "PASS" ]]; then
+            STARRY_TEST_STATUS["$name"]="pass"
+            ok "StarryOS: $name PASS"
+        else
+            STARRY_TEST_STATUS["$name"]="fail"
+            err "StarryOS: $name FAIL (rc=$rc)"
+        fi
+    done
+
+    compare_starry_with_linux_reference
+
     info "Full QEMU log: $starry_output"
+    info "Isolated rootfs: $work_rootfs"
+    info "QEMU config: $qemu_config"
 }
 
 # ============================================================
@@ -637,6 +739,7 @@ print_summary() {
 
     if $RUN_LINUX; then
         echo -e "${C_BOLD}Phase 1 — Linux Multi-Arch Tests:${C_RESET}"
+        local arch
         for arch in x86_64 riscv64 aarch64; do
             local p="${LINUX_PASS[$arch]:-0}"
             local f="${LINUX_FAIL[$arch]:-0}"
@@ -664,6 +767,11 @@ print_summary() {
         else
             echo -e "${STARRY_TOTAL_PASS} passed, ${STARRY_TOTAL_FAIL} failed, ${STARRY_TOTAL_SKIP} skipped"
         fi
+        if [[ $STARRY_COMPAT_MISMATCH -gt 0 ]]; then
+            echo -e "  Compatibility: ${C_RED}${STARRY_COMPAT_MISMATCH} mismatch(es) vs Linux/x86_64${C_RESET}"
+        elif $RUN_LINUX; then
+            echo -e "  Compatibility: ${C_GREEN}matched Linux/x86_64 reference${C_RESET}"
+        fi
         echo ""
     fi
 
@@ -671,22 +779,22 @@ print_summary() {
     echo -e "Build artifacts: ${BUILD_DIR}/"
     echo ""
 
-    # Exit code
     local total_fail=0
     if $RUN_LINUX; then
+        local arch
         for arch in x86_64 riscv64 aarch64; do
             total_fail=$(( total_fail + ${LINUX_FAIL[$arch]:-0} ))
         done
     fi
     if $RUN_STARRY; then
-        total_fail=$(( total_fail + STARRY_TOTAL_FAIL ))
+        total_fail=$(( total_fail + STARRY_TOTAL_FAIL + STARRY_COMPAT_MISMATCH ))
     fi
 
     if [[ $total_fail -eq 0 ]]; then
         ok "All tests PASSED"
         return 0
     else
-        err "$total_fail test(s) FAILED"
+        err "$total_fail issue(s) detected"
         return 1
     fi
 }
@@ -700,16 +808,18 @@ main() {
     echo -e "${C_BOLD}║       Syscall Test Runner — Linux & StarryOS    ║${C_RESET}"
     echo -e "${C_BOLD}╚══════════════════════════════════════════════════╝${C_RESET}"
     echo ""
-    echo "  Test repo:   $SCRIPT_DIR"
-    echo "  StarryOS:    ${TGOSKITS_DIR:-<not set>}"
-    echo "  Host arch:   $HOST_ARCH"
-    echo "  StarryOS arch: $STARRY_ARCH"
+    echo "  Test repo:      $SCRIPT_DIR"
+    echo "  StarryOS:       ${TGOSKITS_DIR:-<not set>}"
+    echo "  Host arch:      $HOST_ARCH"
+    echo "  StarryOS arch:  $STARRY_ARCH"
     echo ""
 
     mkdir -p "$BUILD_DIR" "$LOG_DIR"
 
     if ! $SKIP_DEP_CHECK; then
         check_prerequisites
+    else
+        X86_64_MUSL_CC="$(detect_x86_64_musl_cc || true)"
     fi
 
     if $RUN_LINUX; then
