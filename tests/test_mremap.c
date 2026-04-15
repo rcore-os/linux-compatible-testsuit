@@ -28,8 +28,6 @@
 #define MREMAP_DONTUNMAP 4
 #endif
 
-#define PAGE 4096
-
 static void *raw_mremap(void *old_addr, size_t old_size, size_t new_size,
                         int flags, void *new_addr) {
     long ret = syscall(SYS_mremap, old_addr, old_size, new_size, flags, new_addr);
@@ -37,7 +35,9 @@ static void *raw_mremap(void *old_addr, size_t old_size, size_t new_size,
     return (void *)ret;
 }
 
-int main(void) {
+int main(void)
+{
+    const size_t PAGE = (size_t)sysconf(_SC_PAGE_SIZE);
     TEST_START("mremap");
 
     /* 1. 基本扩展 + 数据保持 + 新页面零初始化 */
