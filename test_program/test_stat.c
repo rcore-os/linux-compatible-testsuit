@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 /* ---------------------------------------------------------------------------
  * Custom assertion macro: prints file/line/expected/actual on failure
@@ -346,8 +347,19 @@ static void test_error_efault(void)
     char path[512];
     snprintf(path, sizeof(path), "%s/regfile.txt", basedir);
 
-    /* Passing NULL as statbuf should produce EFAULT */
-    ASSERT_ERR(stat(path, NULL), EFAULT);
+    /* Use syscall() to bypass libc wrapper, ensuring the kernel handles
+     * the bad address instead of crashing in userspace (e.g. musl). */
+    long rc = -1;
+    errno = ENOSYS;
+#ifdef SYS_stat
+    rc = syscall(SYS_stat, path, NULL);
+#endif
+    if (rc == -1 && errno == ENOSYS) {
+        /* Fallback: try via newfstatat which covers stat on modern kernels */
+        rc = syscall(SYS_newfstatat, AT_FDCWD, path, NULL, 0);
+    }
+    assert(rc == -1);
+    assert(errno == EFAULT);
 }
 #pragma GCC diagnostic pop
 
