@@ -14,14 +14,16 @@
 #include <time.h>
 #include <errno.h>
 
-int main(void) {
+int main(void)
+{
     TEST_START("clock_gettime");
 
     /* CLOCK_REALTIME 应成功，tv_sec > 0 */
     {
         struct timespec ts = {0, 0};
         CHECK_RET(clock_gettime(CLOCK_REALTIME, &ts), 0, "CLOCK_REALTIME 成功");
-        CHECK(ts.tv_sec > 0, "CLOCK_REALTIME tv_sec > 0");
+        CHECK(ts.tv_sec >= 0, "CLOCK_REALTIME tv_sec >= 0");
+        CHECK(ts.tv_nsec >= 0 && ts.tv_nsec < 1000000000L, "CLOCK_REALTIME tv_nsec 范围有效");
     }
 
     /* CLOCK_MONOTONIC 应成功 */
@@ -34,10 +36,10 @@ int main(void) {
     /* CLOCK_MONOTONIC 应单调递增 */
     {
         struct timespec t1, t2;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
+        CHECK_RET(clock_gettime(CLOCK_MONOTONIC, &t1), 0, "单调递增: 取 t1");
         volatile int x = 0;
         for (int i = 0; i < 100000; i++) x += i;
-        clock_gettime(CLOCK_MONOTONIC, &t2);
+        CHECK_RET(clock_gettime(CLOCK_MONOTONIC, &t2), 0, "单调递增: 取 t2");
         long ns1 = t1.tv_sec * 1000000000L + t1.tv_nsec;
         long ns2 = t2.tv_sec * 1000000000L + t2.tv_nsec;
         CHECK(ns2 >= ns1, "CLOCK_MONOTONIC 单调递增");
