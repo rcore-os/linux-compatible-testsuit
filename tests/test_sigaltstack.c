@@ -15,7 +15,8 @@
 #include <stdlib.h>
 #include <errno.h>
 
-int main(void) {
+int main(void)
+{
     TEST_START("sigaltstack");
 
     /* 1. 查询当前备用信号栈 */
@@ -33,12 +34,12 @@ int main(void) {
             CHECK_RET(sigaltstack(&ss, NULL), 0, "设置 SIGSTKSZ 栈");
 
             stack_t check;
-            sigaltstack(NULL, &check);
+            CHECK_RET(sigaltstack(NULL, &check), 0, "查询已设置的栈");
             CHECK(check.ss_sp == buf, "回读 sp 一致");
             CHECK((size_t)check.ss_size == (size_t)SIGSTKSZ, "回读 size 一致");
 
             stack_t disable = { .ss_flags = SS_DISABLE };
-            sigaltstack(&disable, NULL);
+            CHECK_RET(sigaltstack(&disable, NULL), 0, "禁用 SIGSTKSZ 栈");
             free(buf);
         }
     }
@@ -56,7 +57,7 @@ int main(void) {
             CHECK_RET(sigaltstack(&ss, NULL), 0, "设置恰好 MINSIGSTKSZ 的栈");
 
             stack_t disable = { .ss_flags = SS_DISABLE };
-            sigaltstack(&disable, NULL);
+            CHECK_RET(sigaltstack(&disable, NULL), 0, "禁用 MINSIGSTKSZ 栈");
             free(buf);
         }
     }
@@ -67,7 +68,12 @@ int main(void) {
         CHECK(buf != NULL, "分配缓冲区（过小测试）");
         if (buf) {
             stack_t ss = { .ss_sp = buf, .ss_size = MINSIGSTKSZ - 1, .ss_flags = 0 };
-            CHECK_ERR(sigaltstack(&ss, NULL), ENOMEM, "拒绝 MINSIGSTKSZ-1");
+            int rc = sigaltstack(&ss, NULL);
+            CHECK(rc == -1 && errno == ENOMEM, "拒绝 MINSIGSTKSZ-1");
+            if (rc == 0) {
+                stack_t disable = { .ss_flags = SS_DISABLE };
+                sigaltstack(&disable, NULL);
+            }
             free(buf);
         }
     }
@@ -88,6 +94,9 @@ int main(void) {
                 CHECK_RET(sigaltstack(&ss2, &old2), 0, "设置第二个栈，取回旧栈");
                 CHECK(old2.ss_sp == buf, "旧栈 sp 是第一个缓冲区");
                 CHECK((size_t)old2.ss_size == (size_t)SIGSTKSZ, "旧栈 size 是 SIGSTKSZ");
+
+                stack_t disable2 = { .ss_flags = SS_DISABLE };
+                CHECK_RET(sigaltstack(&disable2, NULL), 0, "禁用第二个栈");
                 free(buf2);
             }
 
