@@ -26,7 +26,17 @@ style: |
 ---
 
 # linux-compatible-testsuit
-## 基于 git log 的开发过程分析与阶段总结
+## 如何通过AI自动发现StarryOS的bug并自动修复
+
+**作者**
+
+- 戴骏翔  陈渝
+
+**时间**
+
+- 2026.04.15
+
+---
 
 **分析范围**
 
@@ -47,16 +57,24 @@ style: |
 ---
 
 # 一页结论
-
+0. **设想：如何通过AI自动发现StarryOS的bug，并自动修复。**
 1. 项目最初不是从“完整平台”起步，而是从 `README + syscall 优先级 + 一批测试文件 + 单脚本` 快速起盘。
 2. 真正的架构跃迁发生在 `2026-04-15 01:48` 的 `91bf3c2`：引入 Linux guest `qemu-system-x86_64` 参考基线，使 StarryOS 不再只和 host / `qemu-user` 间接比较。
 3. 随后的开发重点从“多加测试”切换为“修正测试假设”，避免把 musl、root 权限、guest 环境差异误判成内核 bug。
 4. 当前仓库已形成三阶段流水线、统一 marker 协议、可比对的结果摘要，但仍存在文档滞后和平台覆盖不足等工程债务。
+---
 
-```mermaid
-pie title 提交归属
-  "chyyuu (10)" : 10
-  "wyatt-dai (5)" : 5
+
+# 一页结论
+```text
+提交归属
+
+chyyuu    | ########## | 10
+wyatt-dai | #####      |  5
+
+占比观察:
+- chyyuu    : 66.7%
+- wyatt-dai : 33.3%
 ```
 
 ---
@@ -198,18 +216,39 @@ V3: 当前形态
 
 # 当前系统设计
 
-```mermaid
-flowchart LR
-  A[tests/*.c] --> B[run_all_tests.sh]
-  B --> C1[Phase 1<br/>Linux host / qemu-user]
-  B --> C2[Phase 1.5<br/>Linux guest in qemu-system-x86_64]
-  B --> C3[Phase 2<br/>StarryOS]
-  C2 --> D[@@@ STARRY_TEST_* markers]
-  C3 --> D
-  C1 --> E[per-test compile/run logs]
-  D --> F[summary + per-test status]
-  E --> F
-  F --> G[Linux reference vs StarryOS compare]
+```text
+                        +----------------------+
+                        |      tests/*.c       |
+                        +----------+-----------+
+                                   |
+                                   v
+                        +----------------------+
+                        |   run_all_tests.sh   |
+                        +----+-----------+-----+
+                             |           |
+              +--------------+           +------------------+
+              |                                         |
+              v                                         v
+  +---------------------------+            +---------------------------+
+  | Phase 1                   |            | Phase 1.5 / Phase 2       |
+  | Linux host / qemu-user    |            | Linux guest / StarryOS    |
+  +-------------+-------------+            +-------------+-------------+
+                |                                        |
+                v                                        v
+  +---------------------------+            +---------------------------+
+  | compile / run logs        |            | @@@ STARRY_TEST_* marker  |
+  +-------------+-------------+            +-------------+-------------+
+                \                                        /
+                 \                                      /
+                  v                                    v
+                    +--------------------------------+
+                    | summary + per-test status      |
+                    +---------------+----------------+
+                                    |
+                                    v
+                    +--------------------------------+
+                    | Linux reference vs StarryOS    |
+                    +--------------------------------+
 ```
 ---
 
@@ -298,13 +337,23 @@ flowchart LR
 
 # 测试内容与覆盖面
 
-```mermaid
-flowchart LR
-  A[脚本初版] --> B[测试批量导入]
-  B --> C[README / priority / StarryOS 路径]
-  C --> D[Linux guest baseline]
-  D --> E[测试稳定化]
-  E --> F[session summary]
+```text
+脚本初版
+   |
+   v
+测试批量导入
+   |
+   v
+README / priority / StarryOS 路径
+   |
+   v
+Linux guest baseline
+   |
+   v
+测试稳定化
+   |
+   v
+session summary
 ```
 
 ---
@@ -321,6 +370,10 @@ flowchart LR
 | 文档闭环 | `[~]` | 有 README、priority、session summary, 但 README 已滞后 |
 | 平台广度 | `[~]` | guest 仅 `x86_64`; StarryOS 虽支持多架构参数, 历史证据主要集中在 `x86_64` |
 | CI / 趋势追踪 | `[ ]` | git 历史中尚未看到 |
+
+---
+
+# 进展情况
 
 ```text
 成熟度观察
@@ -354,20 +407,30 @@ flowchart LR
 
 ---
 
-# 建议的下一阶段路线图
+# 建议的下一阶段路线图 -- 方案1
 
-```mermaid
-flowchart TD
-  A[短期: 修 README / 同步测试清单] --> B[短期: 固化 Linux guest 基线运行文档]
-  B --> C[中期: 增加 time,sleep,futex,socket 基础测试]
-  C --> D[中期: 加 CI 或 nightly 回归]
-  D --> E[长期: 扩展 guest 到更多架构]
-  E --> F[长期: 建兼容性趋势面板]
+```text
+短期  : 修 README / 同步测试清单
+   |
+   v
+短期  : 固化 Linux guest 基线运行文档
+   |
+   v
+中期  : 增加 time,sleep,futex,socket 基础测试
+   |
+   v
+中期  : 加 CI 或 nightly 回归
+   |
+   v
+长期  : 扩展 guest 到更多架构
+   |
+   v
+长期  : 建兼容性趋势面板
 ```
 
 ---
 
-# 建议的下一阶段路线图
+# 建议的下一阶段路线图 -- 方案2
 
 | 时间层次 | 建议动作 | 原因 |
 |---|---|---|
