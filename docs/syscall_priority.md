@@ -216,55 +216,69 @@
 | Tier 0 | 基本 IO | `tests/test_basic_io.c` | 已存在 |
 | Tier 0 | open/openat | `tests/test_openat.c` | 已存在 |
 | Tier 0 | stat/fstatat | `tests/test_stat.c` | 已存在 |
-| Tier 0 | 时间与睡眠 | 无 | 待补充 |
+| Tier 0 | 时间与睡眠 | `tests/test_clock_gettime.c` | 已存在 |
 | Tier 0 | pipe/pipe2 | `tests/test_pipe2.c` | 已存在 |
 | Tier 1 | fork/clone/execve/wait4 | `tests/test_fork_v2.c` | 已存在 |
 | Tier 1 | dup/fcntl/flock | `tests/test_dup_v2.c` | 已存在 |
 | Tier 1 | mmap/munmap/mprotect | `tests/test_mmap.c` | 已存在 |
 | Tier 1 | 核心信号 | `tests/test_signal.c` | 已存在 |
 | Tier 1 | brk/sbrk | `tests/test_brk.c` | 已存在 |
-| Tier 1 | futex | 无 | 待补充 |
-| Tier 2 | 目录与路径操作 | 无 | 待补充 |
-| Tier 2 | 文件权限与 umask | 无 | 待补充 |
-| Tier 2 | socket/connect/accept | `tests/test_accept4.c` | 已存在 |
-| Tier 2 | select/poll | 无 | 待补充 |
-| Tier 2 | epoll | 无 | 待补充 |
+| Tier 1 | futex | `tests/test_futex.c` | **新增** |
+| Tier 2 | 目录与路径操作 | `tests/test_dir.c` | **新增** |
+| Tier 2 | 文件权限与 umask | `tests/test_fileperm.c` | **新增** |
+| Tier 2 | socket/connect/accept | 无 | 待补充（旧 `test_accept4.c` 已从磁盘移除） |
+| Tier 2 | select/poll | `tests/test_poll.c` | **新增** |
+| Tier 2 | epoll | `tests/test_epoll.c` | **新增** |
 | Tier 3 | socket 数据面 | 无 | 待补充 |
 | Tier 3 | socket 辅助语义 | 无 | 待补充 |
 | Tier 3 | socketpair | 无 | 待补充 |
-| Tier 3 | 向量 IO | 无 | 待补充 |
+| Tier 3 | 向量 IO | `tests/test_pwritev2.c` | 部分覆盖 |
 | Tier 3 | 定时器 | 无 | 待补充 |
-| Tier 3 | mmap 扩展 | 无 | 待补充 |
+| Tier 3 | mmap 扩展 | `tests/test_mremap.c` | 部分覆盖 |
 | Tier 3 | 会话与进程组 | 可拆自 `tests/test_fork_v2.c` | 部分覆盖 |
-| Tier 3 | 随机数 | 无 | 待补充 |
-| Tier 4 | 系统信息与身份 | 无 | 待补充 |
-| Tier 4 | 高级零拷贝 IO | 无 | 待补充 |
+| Tier 3 | 随机数 | `tests/test_getrandom.c` | 已存在 |
+| Tier 4 | 系统信息与身份 | `tests/test_getgroups.c` | 部分覆盖 |
+| Tier 4 | 高级零拷贝 IO | `tests/test_copy_file_range.c` | 部分覆盖 |
 | Tier 4 | 共享内存 | 无 | 待补充 |
 | Tier 4 | 消息队列 | 无 | 待补充 |
 | Tier 4 | 现代 fd | 无 | 待补充 |
 | Tier 4 | 特殊 fd | 无 | 待补充 |
 
+> **注**：`tests/` 下还有若干未列入优先级表的额外测例：`test_file_io_edge.c`、`test_sigaltstack.c`。它们作为现有测试的补充边界覆盖而存在。
+
 ---
 
 ## 六、建议的下一轮补测顺序
 
-如果以当前仓库为起点，建议下一轮新增测试按下面顺序推进：
+以下测试已在本轮完成：
 
-1. `test_time.c`
-2. `test_futex.c`
-3. `test_dir.c`
-4. `test_fileperm.c`
-5. `test_poll.c`
-6. `test_epoll.c`
-7. `test_socket_io.c`
-8. `test_sockopt.c`
-9. `test_iov.c`
-10. `test_getrandom.c`
+| # | 测试文件 | 覆盖 syscall | 检查项数 | 状态 |
+|---|---------|-------------|---------|------|
+| 1 | `test_clock_gettime.c` | clock_gettime (CLOCK_REALTIME/MONOTONIC) | 7 | ✅ 已存在 |
+| 2 | `test_futex.c` | FUTEX_WAIT/WAKE/PRIVATE + 超时 + 跨进程 | 18 | ✅ 本轮新增 |
+| 3 | `test_dir.c` | mkdirat/getcwd/chdir/unlinkat/renameat/linkat/symlinkat/getdents64 | 54 | ✅ 本轮新增 |
+| 4 | `test_fileperm.c` | chmod/fchmod/fchmodat/faccessat/umask | 49 | ✅ 本轮新增 |
+| 5 | `test_poll.c` | select/poll/ppoll + 超时/EOF/EBADF | 32 | ✅ 本轮新增 |
+| 6 | `test_epoll.c` | epoll_create1/ctl/wait + EPOLLET/EPOLLHUP + 跨进程 | 55 | ✅ 本轮新增 |
+
+以上全部测例已在 x86_64、riscv64、aarch64 三架构下通过验证。
+
+下一轮建议新增测试按下面顺序推进：
+
+1. `test_socket_io.c` — socket 数据面 (sendto/recvfrom/sendmsg/recvmsg)
+2. `test_sockopt.c` — socket 辅助语义 (getsockname/getpeername/getsockopt/setsockopt/shutdown)
+3. `test_socketpair.c` — socketpair
+4. `test_iov.c` — 完整向量 IO (readv/writev/pread64/pwrite64/preadv/pwritev)
+5. `test_timer.c` — 定时器 (getitimer/setitimer/timer_create/timer_settime)
+6. `test_nanosleep.c` — nanosleep/clock_nanosleep 完整语义
+7. `test_accept4.c` — socket/connect/accept（需重建，旧文件已不存在）
 
 理由：
 
-- 这一组能直接把当前仓库从“文件/进程/内存主路径”扩到“同步、路径、事件、网络数据面”。
-- 同时它们与现有测试风格最容易对齐，不需要先引入特权操作或复杂环境。
+- 前三项补全了网络相关的完整覆盖（从连接建立到数据面到辅助语义）。
+- 向量 IO 和定时器是 Tier 3 中剩余高价值条目。
+- `test_nanosleep` 与 `test_clock_gettime` 互补，构成时间与睡眠的完整测试。
+- `test_accept4.c` 需要重新实现（旧文件已不在磁盘上）。
 
 ---
 
